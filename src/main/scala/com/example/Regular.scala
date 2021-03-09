@@ -2,6 +2,9 @@ package com.example
 
 import scala.annotation.tailrec
 import cats.data.Chain
+import fs2.Pull
+import cats.Functor
+import cats.implicits._
 
 sealed trait Regular extends Product with Serializable {
   def |(that: Regular): Regular = Regular.Alternative(this, that)
@@ -20,70 +23,70 @@ object Regular {
 
   def apply(c: scala.Char): Regular = Char(c)
 
-  val interpret: (Regular, String) => Boolean = {
-    case class Result(matches: Boolean, leftover: String)
+  val interpret: (Regular, String) => Boolean = (reg, s) => interpretStream[cats.Id](reg, fs2.Stream.emits(s.toSeq))
 
-    def go(current: Regular, remainder: String): Result = {
+  def interpretStream[F[_]: Functor](pattern: Regular, stream: fs2.Stream[F, scala.Char])(implicit S: fs2.Compiler[F, F]): F[Boolean] = {
+    case class Result(matches: Boolean, leftover: fs2.Stream[F, scala.Char])
+
+    def go(current: Regular, remainder: fs2.Stream[F, scala.Char]): Pull[F, Nothing, Result] = {
       val noMatch = Result(false, remainder)
 
       current match {
         case Char(v) =>
-          remainder.headOption match {
-            case Some(next) => Result(v == next, remainder.tail)
-            case None       => noMatch
+          remainder.pull.uncons1.map {
+            case None               => noMatch
+            case Some((next, tail)) => Result(v == next, tail)
           }
 
         case Alternative(left, right) =>
-          val leftResult = go(left, remainder)
-
-          if (leftResult.matches)
-            leftResult
-          else
-            go(right, remainder)
+          go(left, remainder).flatMap {
+            case leftResult if leftResult.matches => Pull.pure(leftResult)
+            case _                                => go(right, remainder)
+          }
 
         case Sequence(left, right) =>
-          val leftResult = go(left, remainder)
-
-          if (leftResult.matches)
-            go(right, leftResult.leftover)
-          else
-            leftResult
+          go(left, remainder).flatMap {
+            case leftResult if leftResult.matches => go(right, leftResult.leftover)
+            case leftResult                       => Pull.pure(leftResult)
+          }
 
         case Optional(underlying) =>
-          val result = go(underlying, remainder)
-
-          if (result.matches)
-            result
-          else
-            Result(true, remainder)
+          go(underlying, remainder).map {
+            case result if result.matches => result
+            case _                        => Result(true, remainder)
+          }
 
         case Repeated(underlying) =>
-          @tailrec
-          def loop(previous: Result): Result = {
-            val result = go(underlying, previous.leftover)
-
-            if (result.matches)
-              loop(result)
-            else
-              previous
-          }
+          // this used to be tailrec
+          def loop(previous: Result): Pull[F, Nothing, Result] =
+            go(underlying, previous.leftover).flatMap {
+              case result if result.matches => loop(result)
+              case _                        => Pull.pure(previous)
+            }
 
           loop(noMatch)
       }
     }
 
-    go(_, _).matches
+    go(pattern, stream)
+      .flatMap(Pull.output1(_))
+      .stream
+      .compile
+      .last
+      .map(_.getOrElse(???))
+      .map(_.matches)
   }
 
 }
 
 object Demo extends App {
-  // println(
-  //   ((Regular('a') ~ Regular('b') ~ Regular('C')) |
-  //     (Regular('d') ~ Regular('e').+) |
-  //     (Regular('f') ~ Regular('g'))).apply("abC|(de+)|fg")
-  // )
+  println(
+    ((Regular('a') ~ Regular('b') ~ Regular('C')) |
+      (Regular('d') ~ Regular('e').+) |
+      (Regular('f') ~ Regular('g'))).apply("abC|(de+)|fg")
+  )
   println(Regular('a').apply("a"))
+  println((Regular('c') | Regular('a')).apply("ad"))
   println((Regular('c') | Regular('a') ~ Regular('d')).apply("ad"))
   println((Regular('c') | Regular('a') ~ Regular('d')).apply("cd"))
 }
